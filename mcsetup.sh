@@ -6,17 +6,17 @@ YELLOW="\e[33m"
 BLUE="\e[34m"
 CYAN="\e[36m"
 RESET="\e[0m"
-BOLD="\e[1m"
 
 echo -e "${BLUE}=== Alfies Minecraft Server Tool ===${RESET}"
-echo ""
+
+command -v curl >/dev/null 2>&1 || { echo "curl missing"; exit 1; }
 
 if command -v apt >/dev/null 2>&1; then PKG="apt"
 elif command -v pacman >/dev/null 2>&1; then PKG="pacman"
 elif command -v dnf >/dev/null 2>&1; then PKG="dnf"
 elif command -v zypper >/dev/null 2>&1; then PKG="zypper"
 else
-    echo -e "${RED}No supported package manager${RESET}"
+    echo -e "${RED}No package manager${RESET}"
     exit 1
 fi
 
@@ -30,16 +30,21 @@ if ! command -v java >/dev/null 2>&1; then
         dnf) sudo dnf install -y java-latest-openjdk ;;
         zypper) sudo zypper install -y java-21-openjdk ;;
     esac
-    echo -e "${GREEN}Java installed${RESET}"
 fi
 
 safe_download() {
     url="$1"
-    if ! curl -f -L -o server.jar "$url"; then
-        echo -e "${RED}Download failed: server.jar${RESET}"
+    if [ -z "$url" ]; then
+        echo -e "${RED}Download URL empty${RESET}"
+        exit 1
+    fi
+
+    if ! curl -fL --silent --show-error -o server.jar "$url"; then
+        echo -e "${RED}Download failed${RESET}"
         echo "$url"
         exit 1
     fi
+
     [ ! -s server.jar ] && echo -e "${RED}Corrupt jar${RESET}" && exit 1
 }
 
@@ -60,95 +65,124 @@ download_velocity() {
 download_vanilla() {
     manifest=$(curl -s https://launchermeta.mojang.com/mc/game/version_manifest.json)
     version_url=$(echo "$manifest" | grep -oP '"url":"[^"]+"' | head -n 1 | cut -d'"' -f4)
+
+    [ -z "$version_url" ] && echo "Vanilla manifest fail" && exit 1
+
     version_json=$(curl -s "$version_url")
     url=$(echo "$version_json" | grep -oP '"server":"[^"]+"' | cut -d'"' -f4)
-    [ -z "$url" ] && echo -e "${RED}Vanilla URL fail${RESET}" && exit 1
+
+    [ -z "$url" ] && echo "Vanilla jar missing" && exit 1
+
     safe_download "$url"
 }
 
-create_systemd_service() {
-    service_name=$(basename "$server_folder")
-    sudo bash -c "cat > /etc/systemd/system/${service_name}.service" <<EOF
+selector() {
+    local items=("$@")
+    local i=0
+
+    tput civis
+
+    while true; do
+        clear
+        echo -e "${BLUE}Select:${RESET}"
+
+        for idx in "${!items[@]}"; do
+            if [ "$idx" -eq "$i" ]; then
+                echo -e "${GREEN}> ${items[$idx]}${RESET}"
+            else
+                echo "  ${items[$idx]}"
+            fi
+        done
+
+        read -rsn1 key
+
+        if [[ $key == $'\x1b' ]]; then
+            read -rsn2 key
+            case $key in
+                "[A") ((i--)) ;;
+                "[B") ((i++)) ;;
+            esac
+        elif [[ $key == "" ]]; then
+            break
+        fi
+
+        ((i < 0)) && i=$((${#items[@]} - 1))
+        ((i >= ${#items[@]})) && i=0
+    done
+
+    tput cnorm
+    return $i
+}
+
+systemd_install() {
+    name=$(basename "$server_folder")
+
+    sudo bash -c "cat > /etc/systemd/system/$name.service" <<EOF
 [Unit]
-Description=Minecraft Server $service_name
+Description=Minecraft Server $name
 After=network.target
 
 [Service]
 WorkingDirectory=$server_folder
 ExecStart=/usr/bin/bash $server_folder/start.sh
 Restart=always
-RestartSec=10
 User=$USER
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    systemctl enable "$service_name"
-    echo -e "${GREEN}systemd installed${RESET}"
+    systemctl enable "$name"
+    echo "systemd installed"
 }
 
 remove_server() {
-    clear
-    echo -e "${RED}Remove Server${RESET}"
     read -p "Name: " name
     read -p "Dir: " dir
+
     path="$dir/$name"
-    [ ! -d "$path" ] && echo "Not found" && sleep 2 && return
-    read -p "Delete systemd? (yes/no): " sys
+
+    [ ! -d "$path" ] && echo "Not found" && return
+
+    read -p "Remove systemd? (yes/no): " s
+
     rm -rf "$path"
-    if [ "$sys" == "yes" ]; then
+
+    if [ "$s" = "yes" ]; then
         sudo systemctl stop "$name" 2>/dev/null
         sudo systemctl disable "$name" 2>/dev/null
         sudo rm -f "/etc/systemd/system/$name.service"
         sudo systemctl daemon-reload
     fi
-    echo -e "${GREEN}Deleted${RESET}"
-    sleep 2
+
+    echo "Deleted"
 }
 
 create_server() {
-    clear
 
     types=("Vanilla" "Paper" "Velocity")
-    t_selected=0
+    selector "${types[@]}"
+    type=$?
 
-    tput civis
-    while true; do
-        clear
-        echo -e "${BLUE}Server Type${RESET}"
-        for i in "${!types[@]}"; do
-            [ "$i" -eq "$t_selected" ] && echo -e "${GREEN}➤ ${types[$i]}${RESET}" || echo "  ${types[$i]}"
-        done
-        read -rsn1 key
-        if [[ $key == $'\x1b' ]]; then
-            read -rsn2 key
-            case $key in
-                "[A") ((t_selected--)) ;;
-                "[B") ((t_selected++)) ;;
-            esac
-        elif [[ $key == "" ]]; then
-            break
-        fi
-        ((t_selected < 0)) && t_selected=$((${#types[@]} - 1))
-        ((t_selected >= ${#types[@]})) && t_selected=0
-    done
-    tput cnorm
-
-    server_type=${types[$t_selected]}
+    server_type="${types[$type]}"
 
     read -p "Version: " version
     read -p "Name: " name
     read -p "Dir: " dir
     dir=${dir:-$(pwd)}
+
     read -p "Port (25565): " port
     port=${port:-25565}
-    read -p "Max players (20): " maxplayers
-    maxplayers=${maxplayers:-20}
-    read -p "Whitelist (yes/no): " whitelist
-    whitelist=${whitelist:-no}
+
+    read -p "Max players (20): " max
+    max=${max:-20}
+
+    read -p "Whitelist (yes/no): " wl
+    wl=${wl:-no}
+
     read -p "Seed: " seed
-    read -p "OP (enter none): " op
+    read -p "OP: " op
 
     server_folder="$dir/$name"
     mkdir -p "$server_folder"
@@ -164,13 +198,13 @@ create_server() {
 
     cat > server.properties <<EOF
 server-port=$port
-motd=$name
-max-players=$maxplayers
-white-list=$whitelist
+max-players=$max
+white-list=$wl
 level-seed=$seed
+motd=$name
 EOF
 
-    [ ! -z "$op" ] && echo "$op" > ops.txt
+    [ -n "$op" ] && echo "$op" > ops.txt
 
     cat > start.sh <<EOF
 #!/bin/bash
@@ -179,66 +213,23 @@ EOF
 
     chmod +x start.sh
 
-    options=("Start Server" "Copy Command" "Systemd Service" "Exit")
-    selected=0
+    options=("Start Server" "Copy Command" "Systemd" "Exit")
+    selector "${options[@]}"
+    c=$?
 
-    while true; do
-        clear
-        echo -e "${BLUE}Action${RESET}"
-        for i in "${!options[@]}"; do
-            [ "$i" -eq "$selected" ] && echo -e "${GREEN}➤ ${options[$i]}${RESET}" || echo "  ${options[$i]}"
-        done
-
-        read -rsn1 key
-        if [[ $key == $'\x1b' ]]; then
-            read -rsn2 key
-            case $key in
-                "[A") ((selected--)) ;;
-                "[B") ((selected++)) ;;
-            esac
-        elif [[ $key == "" ]]; then
-            break
-        fi
-        ((selected < 0)) && selected=$((${#options[@]} - 1))
-        ((selected >= ${#options[@]})) && selected=0
-    done
-
-    clear
-    case $selected in
+    case "$c" in
         0) bash start.sh ;;
         1) echo "cd \"$server_folder\" && bash start.sh" ;;
-        2) create_systemd_service ;;
+        2) systemd_install ;;
         3) exit 0 ;;
     esac
 }
 
-options=("Create Server" "Remove Server" "Exit")
-selected=0
+main=("Create Server" "Remove Server" "Exit")
+selector "${main[@]}"
+m=$?
 
-tput civis
-while true; do
-    clear
-    echo -e "${BLUE}Menu${RESET}"
-    for i in "${!options[@]}"; do
-        [ "$i" -eq "$selected" ] && echo -e "${GREEN}➤ ${options[$i]}${RESET}" || echo "  ${options[$i]}"
-    done
-
-    read -rsn1 key
-    if [[ $key == $'\x1b' ]]; then
-        read -rsn2 key
-        case $key in
-            "[A") ((selected--)) ;;
-            "[B") ((selected++)) ;;
-        esac
-    elif [[ $key == "" ]]; then
-        break
-    fi
-    ((selected < 0)) && selected=$((${#options[@]} - 1))
-    ((selected >= ${#options[@]})) && selected=0
-done
-tput cnorm
-
-case $selected in
+case "$m" in
     0) create_server ;;
     1) remove_server ;;
     2) exit 0 ;;
